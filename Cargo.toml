@@ -26,3 +26,4 @@ catboost-rust = { git = "https://github.com/aryehlev/catboost-rust", branch = "p
 
 [build-dependencies]
 tonic-build = "0.12"
+ureq = { version = "2", features = ["tls"] }

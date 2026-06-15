@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
                 sig.recv().await;
                 info!("SIGUSR1 received — reloading model");
                 let r = reg.clone();
-                match tokio::task::spawn_blocking(move || r.reload()).await {
+                match tokio::task::spawn_blocking(move || r.repository_load()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::error!("model reload failed: {}", e),
                     Err(e) => tracing::error!("reload task panicked: {}", e),

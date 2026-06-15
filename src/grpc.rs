@@ -70,7 +70,8 @@ impl GrpcInferenceService for InferenceService {
         &self,
         req: Request<ModelReadyRequest>,
     ) -> Result<Response<ModelReadyResponse>, Status> {
-        let ready = req.into_inner().name == self.registry.name;
+        let inner = req.into_inner();
+        let ready = inner.name == self.registry.name && self.registry.is_loaded();
         Ok(Response::new(ModelReadyResponse { ready }))
     }
 
@@ -96,7 +97,7 @@ impl GrpcInferenceService for InferenceService {
             return Err(Status::not_found(format!("model '{}' not found", r.name)));
         }
 
-        let model = self.registry.load();
+        let model = self.registry.load_model();
         let mut inputs = vec![ModelMetadataInput {
             name: "float_features".to_string(),
             datatype: "FP32".to_string(),
@@ -148,8 +149,15 @@ impl GrpcInferenceService for InferenceService {
             inner.id.clone()
         };
 
+        if !self.registry.is_loaded() {
+            return Err(Status::unavailable(format!(
+                "model '{}' is not loaded",
+                inner.model_name
+            )));
+        }
+
         // Snapshot — survives reloads in parallel.
-        let model = self.registry.load();
+        let model = self.registry.load_model();
         let dimensions = model.dimensions_count;
         let model_name = model.name.clone();
 
