@@ -3,10 +3,19 @@ use serde::{Deserialize, Serialize};
 // ── Infer ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+pub struct RequestedOutput {
+    pub name: String,
+}
+
+#[derive(Deserialize)]
 pub struct InferRequest {
     #[serde(default)]
     pub id: Option<String>,
     pub inputs: Vec<InferInputTensor>,
+    /// Clients may name the output tensors they want back.
+    /// When provided the first entry's name is used for the response tensor.
+    #[serde(default)]
+    pub outputs: Vec<RequestedOutput>,
 }
 
 #[derive(Deserialize)]

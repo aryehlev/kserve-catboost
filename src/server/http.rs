@@ -133,13 +133,19 @@ async fn infer(
         .map_err(|e| internal(e))?;
 
     let id = req.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let output_name = req
+        .outputs
+        .into_iter()
+        .next()
+        .map(|o| o.name)
+        .unwrap_or_else(|| OUTPUT_TENSOR.to_string());
 
     Ok(Json(InferResponse {
         model_name: reg.name.clone(),
         model_version: reg.version().to_string(),
         id,
         outputs: vec![InferOutputTensor {
-            name: OUTPUT_TENSOR.to_string(),
+            name: output_name,
             datatype: OUTPUT_DTYPE.to_string(),
             shape: out.shape,
             data: out.predictions,

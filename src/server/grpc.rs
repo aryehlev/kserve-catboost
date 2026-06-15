@@ -91,6 +91,7 @@ impl GrpcInferenceService for GrpcService {
             model_name,
             id,
             inputs,
+            outputs: requested_outputs,
             raw_input_contents: raw,
             ..
         } = request.into_inner();
@@ -151,6 +152,11 @@ impl GrpcInferenceService for GrpcService {
         } else {
             id
         };
+        let output_name = requested_outputs
+            .into_iter()
+            .next()
+            .map(|o| o.name)
+            .unwrap_or_else(|| OUTPUT_TENSOR.to_string());
 
         Ok(Response::new(ModelInferResponse {
             model_name: self.registry.name.clone(),
@@ -158,7 +164,7 @@ impl GrpcInferenceService for GrpcService {
             id: resp_id,
             parameters: Default::default(),
             outputs: vec![InferOutputTensor {
-                name: OUTPUT_TENSOR.to_string(),
+                name: output_name,
                 datatype: OUTPUT_DTYPE.to_string(),
                 shape: out.shape,
                 parameters: Default::default(),
