@@ -46,3 +46,34 @@ fn fetch_proto_to(dest: &std::path::Path) -> Result<(), Box<dyn std::error::Erro
     std::fs::write(dest, body)?;
     Ok(())
 }
+
+/// Try to download the latest official KServe proto and overwrite the bundled
+/// copy.  Failures are demoted to cargo warnings so the build still succeeds
+/// using the committed fallback.
+fn fetch_official_proto() {
+    match ureq::get(OFFICIAL_PROTO_URL).call() {
+        Ok(resp) => match resp.into_string() {
+            Ok(body) => {
+                if let Err(e) = std::fs::write(PROTO_PATH, body) {
+                    println!(
+                        "cargo:warning=Could not write fetched proto to {PROTO_PATH}: {e}"
+                    );
+                } else {
+                    println!(
+                        "cargo:warning=Updated {PROTO_PATH} from official KServe source"
+                    );
+                }
+            }
+            Err(e) => {
+                println!(
+                    "cargo:warning=Failed to read proto response body: {e}. Using bundled copy."
+                );
+            }
+        },
+        Err(e) => {
+            println!(
+                "cargo:warning=Failed to fetch official KServe proto ({e}). Using bundled copy."
+            );
+        }
+    }
+}
