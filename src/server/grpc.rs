@@ -4,15 +4,18 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-    inference::{self, RawTensor, TensorData},
+    inference::{self, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR},
     model::ModelRegistry,
 };
-use super::proto::inference::{
-    grpc_inference_service_server::{GrpcInferenceService, GrpcInferenceServiceServer},
-    InferOutputTensor, InferTensorContents, ModelInferRequest, ModelInferResponse,
-    ModelMetadataRequest, ModelMetadataResponse, ModelReadyRequest, ModelReadyResponse,
-    ServerLiveRequest, ServerLiveResponse, ServerMetadataRequest, ServerMetadataResponse,
-    ServerReadyRequest, ServerReadyResponse,
+use super::{
+    proto::inference::{
+        grpc_inference_service_server::{GrpcInferenceService, GrpcInferenceServiceServer},
+        InferOutputTensor, InferTensorContents, ModelInferRequest, ModelInferResponse,
+        ModelMetadataRequest, ModelMetadataResponse, ModelReadyRequest, ModelReadyResponse,
+        ServerLiveRequest, ServerLiveResponse, ServerMetadataRequest, ServerMetadataResponse,
+        ServerReadyRequest, ServerReadyResponse,
+    },
+    EXTENSIONS, PLATFORM,
 };
 
 pub struct GrpcService {
@@ -57,9 +60,9 @@ impl GrpcInferenceService for GrpcService {
         _: Request<ServerMetadataRequest>,
     ) -> Result<Response<ServerMetadataResponse>, Status> {
         Ok(Response::new(ServerMetadataResponse {
-            name: "kserve-catboost".to_string(),
+            name: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            extensions: vec!["model_repository_extension".to_string()],
+            extensions: EXTENSIONS.iter().map(|s| s.to_string()).collect(),
         }))
     }
 
@@ -73,8 +76,8 @@ impl GrpcInferenceService for GrpcService {
         }
         Ok(Response::new(ModelMetadataResponse {
             name: self.registry.name.clone(),
-            versions: vec![self.registry.version.clone()],
-            platform: "catboost".to_string(),
+            versions: vec![self.registry.version().to_string()],
+            platform: PLATFORM.to_string(),
             inputs: vec![],
             outputs: vec![],
         }))
@@ -151,12 +154,12 @@ impl GrpcInferenceService for GrpcService {
 
         Ok(Response::new(ModelInferResponse {
             model_name: self.registry.name.clone(),
-            model_version: self.registry.version.clone(),
+            model_version: self.registry.version().to_string(),
             id: resp_id,
             parameters: Default::default(),
             outputs: vec![InferOutputTensor {
-                name: "output-0".to_string(),
-                datatype: "FP64".to_string(),
+                name: OUTPUT_TENSOR.to_string(),
+                datatype: OUTPUT_DTYPE.to_string(),
                 shape: out.shape,
                 parameters: Default::default(),
                 contents: Some(InferTensorContents {

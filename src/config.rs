@@ -9,8 +9,8 @@ pub struct Config {
     #[arg(long, env = "MODEL_PATH", default_value = "/mnt/models/model.cbm")]
     pub model_path: String,
 
-    #[arg(long, env = "MODEL_VERSION", default_value = "1")]
-    pub model_version: String,
+    #[arg(long, env = "MODEL_VERSION", default_value_t = 1)]
+    pub model_version: u64,
 
     #[arg(long, env = "HTTP_PORT", default_value_t = 8080)]
     pub http_port: u16,

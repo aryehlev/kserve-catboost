@@ -11,12 +11,15 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::{
-    inference::{self, RawTensor, TensorData},
+    inference::{self, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR},
     model::ModelRegistry,
 };
-use super::types::{
-    ErrorResponse, InferRequest, InferResponse, InferOutputTensor,
-    ModelMetadataResponse, RepositoryIndexEntry, ServerMetadataResponse,
+use super::{
+    types::{
+        ErrorResponse, InferOutputTensor, InferRequest, InferResponse, ModelMetadataResponse,
+        RepositoryIndexEntry, ServerMetadataResponse,
+    },
+    EXTENSIONS, PLATFORM,
 };
 
 // ── Error type ───────────────────────────────────────────────────────────────
@@ -65,9 +68,9 @@ async fn ready(State(reg): State<Arc<ModelRegistry>>) -> StatusCode {
 
 async fn server_metadata() -> Json<ServerMetadataResponse> {
     Json(ServerMetadataResponse {
-        name: "kserve-catboost".to_string(),
+        name: env!("CARGO_PKG_NAME").to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        extensions: vec!["model_repository_extension".to_string()],
+        extensions: EXTENSIONS.iter().map(|s| s.to_string()).collect(),
     })
 }
 
@@ -80,8 +83,8 @@ async fn model_metadata(
     }
     Ok(Json(ModelMetadataResponse {
         name: reg.name.clone(),
-        versions: vec![reg.version.clone()],
-        platform: "catboost".to_string(),
+        versions: vec![reg.version().to_string()],
+        platform: PLATFORM.to_string(),
     }))
 }
 
@@ -133,11 +136,11 @@ async fn infer(
 
     Ok(Json(InferResponse {
         model_name: reg.name.clone(),
-        model_version: reg.version.clone(),
+        model_version: reg.version().to_string(),
         id,
         outputs: vec![InferOutputTensor {
-            name: "output-0".to_string(),
-            datatype: "FP64".to_string(),
+            name: OUTPUT_TENSOR.to_string(),
+            datatype: OUTPUT_DTYPE.to_string(),
             shape: out.shape,
             data: out.predictions,
         }],
@@ -146,16 +149,14 @@ async fn infer(
 
 // ── Repository ───────────────────────────────────────────────────────────────
 
-async fn repository_index(State(reg): State<Arc<ModelRegistry>>) -> Json<Vec<RepositoryIndexEntry>> {
-    let state = if reg.is_loaded() {
-        "READY".to_string()
-    } else {
-        "UNAVAILABLE".to_string()
-    };
+async fn repository_index(
+    State(reg): State<Arc<ModelRegistry>>,
+) -> Json<Vec<RepositoryIndexEntry>> {
+    let state = if reg.is_loaded() { "READY" } else { "UNAVAILABLE" };
     Json(vec![RepositoryIndexEntry {
         name: reg.name.clone(),
-        version: reg.version.clone(),
-        state,
+        version: reg.version().to_string(),
+        state: state.to_string(),
         reason: String::new(),
     }])
 }
@@ -199,8 +200,14 @@ pub async fn serve(
         .route("/v2/models/{model_name}/ready", get(model_ready))
         .route("/v2/models/{model_name}/infer", post(infer))
         .route("/v2/repository/index", get(repository_index))
-        .route("/v2/repository/models/{model_name}/load", post(repository_load))
-        .route("/v2/repository/models/{model_name}/unload", post(repository_unload))
+        .route(
+            "/v2/repository/models/{model_name}/load",
+            post(repository_load),
+        )
+        .route(
+            "/v2/repository/models/{model_name}/unload",
+            post(repository_unload),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(registry);
 

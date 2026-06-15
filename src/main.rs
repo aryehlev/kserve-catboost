@@ -22,11 +22,11 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::parse();
 
     info!(
-        model_name  = %cfg.model_name,
-        model_path  = %cfg.model_path,
-        version     = %cfg.model_version,
-        http_port   = cfg.http_port,
-        grpc_port   = cfg.grpc_port,
+        model_name    = %cfg.model_name,
+        model_path    = %cfg.model_path,
+        model_version = cfg.model_version,
+        http_port     = cfg.http_port,
+        grpc_port     = cfg.grpc_port,
         "starting KServe CatBoost backend",
     );
 

@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -13,21 +13,32 @@ use super::CatBoostModel;
 
 pub struct ModelRegistry {
     pub name: String,
-    pub version: String,
+    /// Monotonically increasing — starts at the configured initial version and
+    /// increments by 1 on each successful hot-reload so callers can detect changes.
+    version: AtomicU64,
     model: ArcSwap<CatBoostModel>,
     loaded: AtomicBool,
     path: PathBuf,
 }
 
 impl ModelRegistry {
-    pub fn new(model: CatBoostModel, path: PathBuf, name: String, version: String) -> Self {
+    pub fn new(
+        model: CatBoostModel,
+        path: PathBuf,
+        name: String,
+        initial_version: u64,
+    ) -> Self {
         Self {
             name,
-            version,
+            version: AtomicU64::new(initial_version),
             model: ArcSwap::new(Arc::new(model)),
             loaded: AtomicBool::new(true),
             path,
         }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -41,11 +52,13 @@ impl ModelRegistry {
         Ok(self.model.load_full())
     }
 
+    /// Reload the model from disk and bump the version counter.
     pub fn repository_load(&self) -> Result<()> {
         let model = CatBoostModel::load_file(&self.path)?;
         self.model.store(Arc::new(model));
+        let new_ver = self.version.fetch_add(1, Ordering::AcqRel) + 1;
         self.loaded.store(true, Ordering::Release);
-        tracing::info!(model = %self.name, "model loaded");
+        tracing::info!(model = %self.name, version = new_ver, "model reloaded");
         Ok(())
     }
 
