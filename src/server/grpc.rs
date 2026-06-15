@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::inference::{DynamicBatcher, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR};
+use crate::inference::{DynamicBatcher, OverloadError, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR};
 use super::{
     proto::inference::{
         grpc_inference_service_server::{GrpcInferenceService, GrpcInferenceServiceServer},
@@ -145,7 +145,13 @@ impl GrpcInferenceService for GrpcService {
             .batcher
             .infer(inputs)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| {
+                if e.is::<OverloadError>() {
+                    Status::resource_exhausted(e.to_string())
+                } else {
+                    Status::internal(e.to_string())
+                }
+            })?;
 
         let resp_id = if id.is_empty() {
             Uuid::new_v4().to_string()

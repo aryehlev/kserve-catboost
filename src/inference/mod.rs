@@ -1,6 +1,6 @@
 mod batcher;
 mod parse;
-pub use batcher::DynamicBatcher;
+pub use batcher::{DynamicBatcher, OverloadError};
 pub use parse::{
     decode_raw_floats, decode_raw_strings, json_to_tensor_data, parse_inputs, reshape, RawTensor,
     TensorData,

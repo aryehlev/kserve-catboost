@@ -23,13 +23,14 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::parse();
 
     info!(
-        model_name     = %cfg.model_name,
-        model_path     = %cfg.model_path,
-        model_version  = cfg.model_version,
-        http_port      = cfg.http_port,
-        grpc_port      = cfg.grpc_port,
-        max_batch_size = cfg.max_batch_size,
-        max_batch_wait = cfg.max_batch_wait_ms,
+        model_name          = %cfg.model_name,
+        model_path          = %cfg.model_path,
+        model_version       = cfg.model_version,
+        http_port           = cfg.http_port,
+        grpc_port           = cfg.grpc_port,
+        max_batch_size      = cfg.max_batch_size,
+        max_batch_wait      = cfg.max_batch_wait_ms,
+        preferred_batch_sizes = ?cfg.preferred_batch_sizes,
         "starting KServe CatBoost backend",
     );
 
@@ -46,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         registry,
         cfg.max_batch_size,
         Duration::from_millis(cfg.max_batch_wait_ms),
+        cfg.preferred_batch_sizes,
     ));
 
     let http_addr: std::net::SocketAddr = format!("0.0.0.0:{}", cfg.http_port).parse()?;

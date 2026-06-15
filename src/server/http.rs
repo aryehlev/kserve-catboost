@@ -10,7 +10,7 @@ use axum::{
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::inference::{self, DynamicBatcher, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR};
+use crate::inference::{self, DynamicBatcher, OverloadError, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR};
 use super::{
     types::{
         ErrorResponse, InferOutputTensor, InferRequest, InferResponse, ModelMetadataResponse,
@@ -39,6 +39,10 @@ fn not_found(msg: impl ToString) -> AppError {
 
 fn unavailable(msg: impl ToString) -> AppError {
     AppError(StatusCode::SERVICE_UNAVAILABLE, msg.to_string())
+}
+
+fn too_many_requests(msg: impl ToString) -> AppError {
+    AppError(StatusCode::TOO_MANY_REQUESTS, msg.to_string())
 }
 
 fn internal(msg: impl ToString) -> AppError {
@@ -126,7 +130,13 @@ async fn infer(
         .collect();
 
     let inputs = inference::parse_inputs(tensors?).map_err(|e| bad_request(e))?;
-    let out = svc.infer(inputs).await.map_err(|e| internal(e))?;
+    let out = svc.infer(inputs).await.map_err(|e| {
+        if e.is::<OverloadError>() {
+            too_many_requests(e)
+        } else {
+            internal(e)
+        }
+    })?;
 
     let id = req.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let output_name = req
