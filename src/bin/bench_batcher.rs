@@ -3,11 +3,18 @@
 /// Two measurement modes:
 ///
 ///   OVERHEAD  – predict is instant (0 µs).  Shows the raw coordination cost
-///               of the batcher (channel send, batch-loop recv, oneshot fan-back)
-///               vs direct spawn_blocking with no real work.
+///               of the batcher vs direct spawn_blocking with no real work.
 ///
-///   THROUGHPUT – predict costs 10 ms fixed + 0.1 ms/row, simulating CatBoost's
-///                C-FFI boundary.  Shows how much batching reduces wall time.
+///   THROUGHPUT – predict costs 10 ms fixed + 0.1 ms/row, simulating CatBoost.
+///
+/// Two dispatch strategies are compared:
+///
+///   BLOCKING dispatch: batch loop awaits spawn_blocking before accepting the
+///     next request. Serialises collection and dispatch — bad for passthrough.
+///
+///   PIPELINED dispatch: batch loop fires spawn_blocking as a spawned task
+///     and immediately loops back to collect the next batch. Collection and
+///     dispatch overlap: the loop never stalls waiting for predict to finish.
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -50,14 +57,72 @@ async fn bench_direct(n_requests: usize, fixed_us: u64) -> (Duration, Vec<Durati
     (start.elapsed(), latencies)
 }
 
-// ── batched: inline batcher (same channel/loop pattern as DynamicBatcher) ─────
+// ── shared types ──────────────────────────────────────────────────────────────
 
 struct BenchItem {
     row_count: usize,
     tx: oneshot::Sender<Vec<f64>>,
 }
 
-async fn bench_batched(
+// Collect a batch from the channel (shared logic for both dispatch strategies).
+async fn collect_batch(
+    rx: &mut mpsc::Receiver<BenchItem>,
+    max_batch: usize,
+    max_wait: Duration,
+) -> Option<(Vec<BenchItem>, usize)> {
+    // Phase 1: blocking wait for first item
+    let first = rx.recv().await?;
+    let mut items = vec![first];
+    let mut total = items[0].row_count;
+
+    // Phase 1b: synchronous drain
+    while total < max_batch {
+        match rx.try_recv() {
+            Ok(item) => { total += item.row_count; items.push(item); }
+            Err(_) => break,
+        }
+    }
+
+    // Phase 2: deadline loop
+    if !max_wait.is_zero() && total < max_batch {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        'collect: loop {
+            if total >= max_batch { break; }
+            let mut extra: Vec<BenchItem> = Vec::new();
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => break 'collect,
+                got = rx.recv_many(&mut extra, 1) => {
+                    if got == 0 { break 'collect; }
+                    for item in extra { total += item.row_count; items.push(item); }
+                    while total < max_batch {
+                        match rx.try_recv() {
+                            Ok(item) => { total += item.row_count; items.push(item); }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some((items, total))
+}
+
+fn dispatch_batch(items: Vec<BenchItem>, total: usize, fixed_us: u64) {
+    let row_counts: Vec<usize> = items.iter().map(|i| i.row_count).collect();
+    let senders: Vec<_> = items.into_iter().map(|i| i.tx).collect();
+    let predictions = fake_predict(total, fixed_us);
+    let mut offset = 0;
+    for (count, sender) in row_counts.into_iter().zip(senders) {
+        let _ = sender.send(predictions[offset..offset + count].to_vec());
+        offset += count;
+    }
+}
+
+// ── blocking dispatch: loop awaits dispatch before next recv ──────────────────
+
+async fn bench_batched_blocking(
     n_requests: usize,
     max_batch: usize,
     max_wait: Duration,
@@ -66,69 +131,47 @@ async fn bench_batched(
     let (tx, mut rx) = mpsc::channel::<BenchItem>(n_requests + 64);
 
     let loop_handle = tokio::spawn(async move {
-        loop {
-            // Phase 1: blocking wait
-            let first = match rx.recv().await {
-                Some(item) => item,
-                None => return,
-            };
-            let mut items = vec![first];
-            let mut total = items[0].row_count;
-
-            // Phase 1b: synchronous drain
-            while total < max_batch {
-                match rx.try_recv() {
-                    Ok(item) => {
-                        total += item.row_count;
-                        items.push(item);
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            // Phase 2: deadline loop
-            if !max_wait.is_zero() && total < max_batch {
-                let deadline = tokio::time::Instant::now() + max_wait;
-                'collect: loop {
-                    if total >= max_batch {
-                        break;
-                    }
-                    let mut extra: Vec<BenchItem> = Vec::new();
-                    tokio::select! {
-                        biased;
-                        _ = tokio::time::sleep_until(deadline) => break 'collect,
-                        got = rx.recv_many(&mut extra, 1) => {
-                            if got == 0 { break 'collect; }
-                            for item in extra {
-                                total += item.row_count;
-                                items.push(item);
-                            }
-                            while total < max_batch {
-                                match rx.try_recv() {
-                                    Ok(item) => { total += item.row_count; items.push(item); }
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            let row_counts: Vec<usize> = items.iter().map(|i| i.row_count).collect();
-            let senders: Vec<_> = items.into_iter().map(|i| i.tx).collect();
-
-            let predictions = task::spawn_blocking(move || fake_predict(total, fixed_us))
+        while let Some((items, total)) = collect_batch(&mut rx, max_batch, max_wait).await {
+            // Awaiting here means the loop stalls until dispatch finishes.
+            task::spawn_blocking(move || dispatch_batch(items, total, fixed_us))
                 .await
                 .unwrap();
-
-            let mut offset = 0;
-            for (count, sender) in row_counts.into_iter().zip(senders) {
-                let _ = sender.send(predictions[offset..offset + count].to_vec());
-                offset += count;
-            }
         }
     });
 
+    let elapsed = drive_requests(n_requests, tx).await;
+    loop_handle.abort();
+    elapsed
+}
+
+// ── pipelined dispatch: loop fires dispatch as a task, loops back immediately ─
+
+async fn bench_batched_pipelined(
+    n_requests: usize,
+    max_batch: usize,
+    max_wait: Duration,
+    fixed_us: u64,
+) -> (Duration, Vec<Duration>) {
+    let (tx, mut rx) = mpsc::channel::<BenchItem>(n_requests + 64);
+
+    let loop_handle = tokio::spawn(async move {
+        while let Some((items, total)) = collect_batch(&mut rx, max_batch, max_wait).await {
+            // Spawn dispatch independently — loop returns to recv immediately.
+            task::spawn_blocking(move || dispatch_batch(items, total, fixed_us));
+        }
+    });
+
+    let elapsed = drive_requests(n_requests, tx).await;
+    loop_handle.abort();
+    elapsed
+}
+
+// ── shared request driver ─────────────────────────────────────────────────────
+
+async fn drive_requests(
+    n_requests: usize,
+    tx: mpsc::Sender<BenchItem>,
+) -> (Duration, Vec<Duration>) {
     let shared_tx = Arc::new(tx);
     let start = Instant::now();
     let handles: Vec<_> = (0..n_requests)
@@ -149,10 +192,7 @@ async fn bench_batched(
     for h in handles {
         latencies.push(h.await.unwrap());
     }
-    let elapsed = start.elapsed();
-
-    loop_handle.abort();
-    (elapsed, latencies)
+    (start.elapsed(), latencies)
 }
 
 // ── stats ─────────────────────────────────────────────────────────────────────
@@ -162,13 +202,13 @@ fn percentile(sorted: &[Duration], pct: usize) -> Duration {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-fn print_latency(label: &str, n: usize, total: Duration, mut lats: Vec<Duration>) {
+fn print_row(label: &str, n: usize, total: Duration, mut lats: Vec<Duration>) {
     lats.sort_unstable();
     let rps = n as f64 / total.as_secs_f64();
     let p50 = percentile(&lats, 50);
     let p99 = percentile(&lats, 99);
     println!(
-        "  {label:<42} {:>7.1} ms   {:>8.0} req/s   p50={:.2}ms  p99={:.2}ms",
+        "  {label:<48} {:>7.1} ms   {:>8.0} req/s   p50={:.2}ms  p99={:.2}ms",
         total.as_secs_f64() * 1000.0,
         rps,
         p50.as_secs_f64() * 1000.0,
@@ -186,54 +226,57 @@ fn main() {
         .unwrap();
 
     // ── Section 1: Overhead (0 µs predict) ───────────────────────────────────
-    const N_OVERHEAD: usize = 1_000;
+    const N: usize = 1_000;
+    println!("\n=== Overhead ({N} concurrent requests, predict = instant) ===\n");
     println!(
-        "\n=== Batcher coordination overhead ({N_OVERHEAD} concurrent requests, predict = instant) ===\n"
-    );
-    println!(
-        "  {:<42} {:>10}   {:>12}   {}",
+        "  {:<48} {:>10}   {:>12}   {}",
         "config", "elapsed", "throughput", "per-request latency"
     );
-    println!("  {}", "-".repeat(85));
+    println!("  {}", "-".repeat(92));
 
-    let (t, l) = rt.block_on(bench_direct(N_OVERHEAD, 0));
-    print_latency("direct (spawn_blocking, instant)", N_OVERHEAD, t, l);
+    let (t, l) = rt.block_on(bench_direct(N, 0));
+    print_row("direct (spawn_blocking, instant)", N, t, l);
 
-    // passthrough: max_batch=1, wait=0 → each request dispatched immediately
-    let (t, l) = rt.block_on(bench_batched(N_OVERHEAD, 1, Duration::ZERO, 0));
-    print_latency("batcher passthrough (max=1, wait=0ms)", N_OVERHEAD, t, l);
+    println!("  -- blocking dispatch --");
+    let (t, l) = rt.block_on(bench_batched_blocking(N, 1, Duration::ZERO, 0));
+    print_row("batcher blocking (max=1,  wait=0ms)", N, t, l);
+    let (t, l) = rt.block_on(bench_batched_blocking(N, 64, Duration::from_millis(1), 0));
+    print_row("batcher blocking (max=64, wait=1ms)", N, t, l);
+    let (t, l) = rt.block_on(bench_batched_blocking(N, N, Duration::from_millis(5), 0));
+    print_row(&format!("batcher blocking (max={N}, wait=5ms)"), N, t, l);
 
-    // small batch window
-    let (t, l) = rt.block_on(bench_batched(N_OVERHEAD, 64, Duration::from_millis(1), 0));
-    print_latency("batcher (max=64, wait=1ms)", N_OVERHEAD, t, l);
+    println!("  -- pipelined dispatch --");
+    let (t, l) = rt.block_on(bench_batched_pipelined(N, 1, Duration::ZERO, 0));
+    print_row("batcher pipelined (max=1,  wait=0ms)", N, t, l);
+    let (t, l) = rt.block_on(bench_batched_pipelined(N, 64, Duration::from_millis(1), 0));
+    print_row("batcher pipelined (max=64, wait=1ms)", N, t, l);
+    let (t, l) = rt.block_on(bench_batched_pipelined(N, N, Duration::from_millis(5), 0));
+    print_row(&format!("batcher pipelined (max={N}, wait=5ms)"), N, t, l);
 
-    // large batch window — absorbs all requests into a few batches
-    let (t, l) = rt.block_on(bench_batched(N_OVERHEAD, N_OVERHEAD, Duration::from_millis(5), 0));
-    print_latency(&format!("batcher (max={N_OVERHEAD}, wait=5ms)"), N_OVERHEAD, t, l);
-
-    // ── Section 2: Throughput (10 ms fixed predict overhead) ─────────────────
-    const N_THROUGHPUT: usize = 100;
+    // ── Section 2: Throughput (10 ms fixed predict) ───────────────────────────
+    const NT: usize = 100;
     println!(
-        "\n=== Throughput ({N_THROUGHPUT} concurrent requests, predict = 10 ms fixed + 0.1 ms/row) ===\n"
+        "\n=== Throughput ({NT} concurrent requests, predict = 10 ms fixed + 0.1 ms/row) ===\n"
     );
     println!(
-        "  {:<42} {:>10}   {:>12}   {}",
+        "  {:<48} {:>10}   {:>12}   {}",
         "config", "elapsed", "throughput", "per-request latency"
     );
-    println!("  {}", "-".repeat(85));
+    println!("  {}", "-".repeat(92));
 
-    let (t, l) = rt.block_on(bench_direct(N_THROUGHPUT, 10_000));
-    print_latency("direct (no batcher)", N_THROUGHPUT, t, l);
+    let (t, l) = rt.block_on(bench_direct(NT, 10_000));
+    print_row("direct (no batcher)", NT, t, l);
 
-    for &(max_batch, wait_ms) in &[(16usize, 5u64), (32, 10), (64, 20), (N_THROUGHPUT, 50)] {
-        let label = format!("batched (max={max_batch}, wait={wait_ms}ms)");
-        let (t, l) = rt.block_on(bench_batched(
-            N_THROUGHPUT,
-            max_batch,
-            Duration::from_millis(wait_ms),
-            10_000,
-        ));
-        print_latency(&label, N_THROUGHPUT, t, l);
+    println!("  -- blocking dispatch --");
+    for &(mb, wms) in &[(16usize, 5u64), (32, 10), (64, 20), (NT, 50)] {
+        let (t, l) = rt.block_on(bench_batched_blocking(NT, mb, Duration::from_millis(wms), 10_000));
+        print_row(&format!("batcher blocking (max={mb}, wait={wms}ms)"), NT, t, l);
+    }
+
+    println!("  -- pipelined dispatch --");
+    for &(mb, wms) in &[(16usize, 5u64), (32, 10), (64, 20), (NT, 50)] {
+        let (t, l) = rt.block_on(bench_batched_pipelined(NT, mb, Duration::from_millis(wms), 10_000));
+        print_row(&format!("batcher pipelined (max={mb}, wait={wms}ms)"), NT, t, l);
     }
 
     println!();

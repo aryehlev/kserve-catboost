@@ -240,11 +240,13 @@ async fn batch_loop(
             }
         }
 
-        dispatch(&registry, batch, total_rows).await;
+        // Spawn dispatch independently so this loop immediately goes back to
+        // collecting the next batch, overlapping collection with inference.
+        tokio::spawn(dispatch(registry.clone(), batch, total_rows));
     }
 }
 
-async fn dispatch(registry: &Arc<ModelRegistry>, batch: Vec<BatchItem>, total_rows: usize) {
+async fn dispatch(registry: Arc<ModelRegistry>, batch: Vec<BatchItem>, total_rows: usize) {
     let mut all_floats: Vec<Vec<f32>> = Vec::with_capacity(total_rows);
     let mut all_cats: Vec<Vec<String>> = Vec::with_capacity(total_rows);
     let mut row_counts: Vec<usize> = Vec::with_capacity(batch.len());
