@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
@@ -35,11 +41,18 @@ struct BatchItem {
 ///   2. `total_rows >= any preferred_batch_size`  (Triton-style early dispatch)
 ///   3. `max_wait` has elapsed since the first request in the batch arrived
 ///
+/// `num_workers` independent batch-loop tasks run in parallel, each with its
+/// own channel. Incoming requests are distributed round-robin so multiple
+/// CatBoost calls can overlap. Default is the number of logical CPUs.
+///
 /// With `max_batch_size = 1` (the default) every request is dispatched
 /// immediately — the batcher acts as a passthrough.
 pub struct DynamicBatcher {
     pub registry: Arc<ModelRegistry>,
-    tx: mpsc::Sender<BatchItem>,
+    /// One sender per worker; round-robin dispatch across them.
+    senders: Vec<mpsc::Sender<BatchItem>>,
+    /// Monotonically increasing counter used to select the next sender.
+    next: AtomicUsize,
 }
 
 impl DynamicBatcher {
@@ -48,47 +61,73 @@ impl DynamicBatcher {
         max_batch_size: usize,
         max_wait: Duration,
         preferred_batch_sizes: Vec<usize>,
+        num_workers: usize,
     ) -> Self {
-        // Buffer = 4× the batch ceiling so senders are rarely blocked under
-        // normal load, but backpressure still engages under sustained overload.
+        let num_workers = num_workers.max(1);
+        // Per-worker channel capacity: 4× batch ceiling so senders are rarely
+        // blocked, but backpressure still engages under sustained overload.
         let capacity = (max_batch_size * 4).max(64);
-        let (tx, rx) = mpsc::channel(capacity);
-        tokio::spawn(batch_loop(
-            registry.clone(),
-            rx,
-            max_batch_size,
-            max_wait,
-            preferred_batch_sizes,
-        ));
-        Self { registry, tx }
+
+        let mut senders = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let (tx, rx) = mpsc::channel(capacity);
+            senders.push(tx);
+            tokio::spawn(batch_loop(
+                registry.clone(),
+                rx,
+                max_batch_size,
+                max_wait,
+                preferred_batch_sizes.clone(),
+            ));
+        }
+
+        Self {
+            registry,
+            senders,
+            next: AtomicUsize::new(0),
+        }
     }
 
     pub async fn infer(&self, inputs: InferInputs) -> Result<InferOutput> {
         let row_count = inputs.float_features.len().max(inputs.cat_features.len());
         let (result_tx, result_rx) = oneshot::channel();
 
-        // Non-blocking send: shed load immediately rather than letting callers
-        // queue up inside the server. Returns OverloadError when full.
-        self.tx
-            .try_send(BatchItem {
-                float_features: inputs.float_features,
-                cat_features: inputs.cat_features,
-                row_count,
-                tx: result_tx,
-            })
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => anyhow::Error::new(OverloadError),
-                mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("batcher shut down"),
-            })?;
+        let mut item = BatchItem {
+            float_features: inputs.float_features,
+            cat_features: inputs.cat_features,
+            row_count,
+            tx: result_tx,
+        };
 
-        let predictions = result_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("batcher dropped response"))??;
+        // Round-robin starting point; Relaxed is fine — we only need rough
+        // distribution, not strict ordering.
+        let n = self.senders.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
 
-        Ok(InferOutput {
-            shape: vec![row_count as i64, 1],
-            predictions,
-        })
+        // Try each worker in order; use the first one with queue space.
+        // Only return OverloadError if every worker's queue is full.
+        for i in 0..n {
+            let idx = (start + i) % n;
+            match self.senders[idx].try_send(item) {
+                Ok(()) => {
+                    let predictions = result_rx
+                        .await
+                        .map_err(|_| anyhow::anyhow!("batcher dropped response"))??;
+                    return Ok(InferOutput {
+                        shape: vec![row_count as i64, 1],
+                        predictions,
+                    });
+                }
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    item = returned; // try next worker
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(anyhow::anyhow!("batcher shut down"));
+                }
+            }
+        }
+
+        Err(anyhow::Error::new(OverloadError))
     }
 }
 
@@ -122,7 +161,7 @@ async fn batch_loop(
 
         // ── Phase 1b: synchronous drain ───────────────────────────────────────
         // Grab any items that are already in the channel without paying async
-        // overhead. This closes the gap between Phase 1 and Phase 2 cheaply.
+        // overhead. Closes the gap between Phase 1 and Phase 2 cheaply.
         while total_rows < max_batch_size {
             match rx.try_recv() {
                 Ok(item) => {
@@ -164,8 +203,7 @@ async fn batch_loop(
                             total_rows += item.row_count;
                             batch.push(item);
                         }
-                        // Drain any synchronously available items after the
-                        // async receive — same pattern as Phase 1b.
+                        // Synchronous drain after each async receive.
                         while total_rows < max_batch_size {
                             match rx.try_recv() {
                                 Ok(item) => { total_rows += item.row_count; batch.push(item); }

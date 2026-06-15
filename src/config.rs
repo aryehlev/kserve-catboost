@@ -34,4 +34,13 @@ pub struct Config {
     /// Mirrors Triton's preferred_batch_size semantics.
     #[arg(long, env = "PREFERRED_BATCH_SIZES", value_delimiter = ',', num_args = 0..)]
     pub preferred_batch_sizes: Vec<usize>,
+
+    /// Number of independent batch-loop workers. Each worker owns its own
+    /// channel and can run a CatBoost call concurrently with the others.
+    /// Defaults to the number of logical CPUs on the host.
+    #[arg(
+        long, env = "NUM_BATCH_WORKERS",
+        default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    )]
+    pub num_batch_workers: usize,
 }
