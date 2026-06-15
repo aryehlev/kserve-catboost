@@ -62,10 +62,9 @@ struct BatchItem {
 /// entirely and calls the model directly — zero batcher overhead.
 pub struct DynamicBatcher {
     pub registry: Arc<ModelRegistry>,
-    /// One sender per worker; least-loaded routing with round-robin tiebreak.
+    /// One sender per worker; round-robin dispatch across them.
     senders: Vec<mpsc::Sender<BatchItem>>,
-    /// Tiebreak counter: incremented on every call to spread load evenly when
-    /// workers have equal queue depths (common at startup and low traffic).
+    /// Monotonically increasing counter used to select the next sender.
     next: AtomicUsize,
     /// Cached from construction; enables the fast-path bypass in `infer`.
     max_batch_size: usize,
@@ -125,21 +124,18 @@ impl DynamicBatcher {
             tx: result_tx,
         };
 
-        // Least-loaded routing: try workers sorted by queue depth (ascending).
-        // When depths are equal the tiebreak counter gives round-robin spread.
-        // Relaxed is fine — we only need rough distribution, not strict ordering.
+        // Round-robin starting point; Relaxed is fine — we only need rough
+        // distribution, not strict ordering.
         let n = self.senders.len();
-        let base = self.next.fetch_add(1, Ordering::Relaxed);
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
 
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| {
-            let depth = self.senders[i].max_capacity() - self.senders[i].capacity();
-            (depth, (i + n - base % n) % n)
-        });
-
+        // Try each worker in order; use the first one with queue space.
+        // A closed worker is treated as a failed candidate so we keep
+        // probing rather than aborting on the first dead channel.
         let mut saw_full = false;
         let mut saw_closed = false;
-        for &idx in &order {
+        for i in 0..n {
+            let idx = (start + i) % n;
             match self.senders[idx].try_send(item) {
                 Ok(()) => {
                     let (arc, start, end) = result_rx
