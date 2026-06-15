@@ -52,10 +52,19 @@ pub struct ServerMetadataResponse {
 }
 
 #[derive(Serialize)]
+pub struct MetadataTensor {
+    pub name: String,
+    pub datatype: String,
+    pub shape: Vec<i64>,
+}
+
+#[derive(Serialize)]
 pub struct ModelMetadataResponse {
     pub name: String,
     pub versions: Vec<String>,
     pub platform: String,
+    pub inputs: Vec<MetadataTensor>,
+    pub outputs: Vec<MetadataTensor>,
 }
 
 // ── Repository ───────────────────────────────────────────────────────────────
