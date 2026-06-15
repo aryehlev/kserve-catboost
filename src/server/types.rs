@@ -1,0 +1,67 @@
+use serde::{Deserialize, Serialize};
+
+// ── Infer ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct InferRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub inputs: Vec<InferInputTensor>,
+}
+
+#[derive(Deserialize)]
+pub struct InferInputTensor {
+    pub name: String,
+    pub datatype: String,
+    pub shape: Vec<i64>,
+    pub data: serde_json::Value,
+}
+
+#[derive(Serialize)]
+pub struct InferResponse {
+    pub model_name: String,
+    pub model_version: String,
+    pub id: String,
+    pub outputs: Vec<InferOutputTensor>,
+}
+
+#[derive(Serialize)]
+pub struct InferOutputTensor {
+    pub name: String,
+    pub datatype: String,
+    pub shape: Vec<i64>,
+    pub data: Vec<f64>,
+}
+
+// ── Metadata ─────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct ServerMetadataResponse {
+    pub name: String,
+    pub version: String,
+    pub extensions: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ModelMetadataResponse {
+    pub name: String,
+    pub versions: Vec<String>,
+    pub platform: String,
+}
+
+// ── Repository ───────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct RepositoryIndexEntry {
+    pub name: String,
+    pub version: String,
+    pub state: String,
+    pub reason: String,
+}
+
+// ── Error ────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}
