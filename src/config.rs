@@ -17,4 +17,14 @@ pub struct Config {
 
     #[arg(long, env = "GRPC_PORT", default_value_t = 9000)]
     pub grpc_port: u16,
+
+    /// Maximum rows to accumulate before dispatching a batch.
+    /// Set to 1 (default) for no batching — each request is dispatched immediately.
+    #[arg(long, env = "MAX_BATCH_SIZE", default_value_t = 1)]
+    pub max_batch_size: usize,
+
+    /// How long (ms) to wait for more requests before flushing an incomplete batch.
+    /// Only relevant when MAX_BATCH_SIZE > 1.
+    #[arg(long, env = "MAX_BATCH_WAIT_MS", default_value_t = 5)]
+    pub max_batch_wait_ms: u64,
 }

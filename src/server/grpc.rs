@@ -3,10 +3,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::{
-    inference::{self, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR},
-    model::ModelRegistry,
-};
+use crate::inference::{DynamicBatcher, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR};
 use super::{
     proto::inference::{
         grpc_inference_service_server::{GrpcInferenceService, GrpcInferenceServiceServer},
@@ -19,12 +16,12 @@ use super::{
 };
 
 pub struct GrpcService {
-    registry: Arc<ModelRegistry>,
+    batcher: Arc<DynamicBatcher>,
 }
 
 impl GrpcService {
-    pub fn new(registry: Arc<ModelRegistry>) -> Self {
-        Self { registry }
+    pub fn new(batcher: Arc<DynamicBatcher>) -> Self {
+        Self { batcher }
     }
 }
 
@@ -42,7 +39,7 @@ impl GrpcInferenceService for GrpcService {
         _: Request<ServerReadyRequest>,
     ) -> Result<Response<ServerReadyResponse>, Status> {
         Ok(Response::new(ServerReadyResponse {
-            ready: self.registry.is_loaded(),
+            ready: self.batcher.registry.is_loaded(),
         }))
     }
 
@@ -51,7 +48,7 @@ impl GrpcInferenceService for GrpcService {
         request: Request<ModelReadyRequest>,
     ) -> Result<Response<ModelReadyResponse>, Status> {
         let req = request.into_inner();
-        let ready = req.name == self.registry.name && self.registry.is_loaded();
+        let ready = req.name == self.batcher.registry.name && self.batcher.registry.is_loaded();
         Ok(Response::new(ModelReadyResponse { ready }))
     }
 
@@ -71,12 +68,12 @@ impl GrpcInferenceService for GrpcService {
         request: Request<ModelMetadataRequest>,
     ) -> Result<Response<ModelMetadataResponse>, Status> {
         let req = request.into_inner();
-        if req.name != self.registry.name {
+        if req.name != self.batcher.registry.name {
             return Err(Status::not_found(format!("no model '{}'", req.name)));
         }
         Ok(Response::new(ModelMetadataResponse {
-            name: self.registry.name.clone(),
-            versions: vec![self.registry.version().to_string()],
+            name: self.batcher.registry.name.clone(),
+            versions: vec![self.batcher.registry.version().to_string()],
             platform: PLATFORM.to_string(),
             inputs: vec![],
             outputs: vec![],
@@ -96,14 +93,15 @@ impl GrpcInferenceService for GrpcService {
             ..
         } = request.into_inner();
 
-        if model_name != self.registry.name {
+        if model_name != self.batcher.registry.name {
             return Err(Status::not_found(format!("no model '{model_name}'")));
         }
-
-        let model = self
-            .registry
-            .current_model()
-            .map_err(|e| Status::unavailable(e.to_string()))?;
+        if !self.batcher.registry.is_loaded() {
+            return Err(Status::unavailable(format!(
+                "model '{}' is not loaded",
+                self.batcher.registry.name
+            )));
+        }
 
         let tensors: Result<Vec<RawTensor>, Status> = inputs
             .into_iter()
@@ -140,10 +138,12 @@ impl GrpcInferenceService for GrpcService {
             })
             .collect();
 
-        let inputs = inference::parse_inputs(tensors?)
+        let inputs = crate::inference::parse_inputs(tensors?)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        let out = inference::run_blocking(model, inputs)
+        let out = self
+            .batcher
+            .infer(inputs)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -159,8 +159,8 @@ impl GrpcInferenceService for GrpcService {
             .unwrap_or_else(|| OUTPUT_TENSOR.to_string());
 
         Ok(Response::new(ModelInferResponse {
-            model_name: self.registry.name.clone(),
-            model_version: self.registry.version().to_string(),
+            model_name: self.batcher.registry.name.clone(),
+            model_version: self.batcher.registry.version().to_string(),
             id: resp_id,
             parameters: Default::default(),
             outputs: vec![InferOutputTensor {
@@ -180,9 +180,9 @@ impl GrpcInferenceService for GrpcService {
 
 pub async fn serve(
     addr: std::net::SocketAddr,
-    registry: Arc<ModelRegistry>,
+    batcher: Arc<DynamicBatcher>,
 ) -> anyhow::Result<()> {
-    let svc = GrpcInferenceServiceServer::new(GrpcService::new(registry));
+    let svc = GrpcInferenceServiceServer::new(GrpcService::new(batcher));
     tonic::transport::Server::builder()
         .add_service(svc)
         .serve(addr)

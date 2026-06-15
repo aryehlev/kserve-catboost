@@ -10,10 +10,7 @@ use axum::{
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::{
-    inference::{self, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR},
-    model::ModelRegistry,
-};
+use crate::inference::{self, DynamicBatcher, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR};
 use super::{
     types::{
         ErrorResponse, InferOutputTensor, InferRequest, InferResponse, ModelMetadataResponse,
@@ -56,8 +53,8 @@ async fn live() -> StatusCode {
     StatusCode::OK
 }
 
-async fn ready(State(reg): State<Arc<ModelRegistry>>) -> StatusCode {
-    if reg.is_loaded() {
+async fn ready(State(svc): State<Arc<DynamicBatcher>>) -> StatusCode {
+    if svc.registry.is_loaded() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -75,24 +72,24 @@ async fn server_metadata() -> Json<ServerMetadataResponse> {
 }
 
 async fn model_metadata(
-    State(reg): State<Arc<ModelRegistry>>,
+    State(svc): State<Arc<DynamicBatcher>>,
     Path(model_name): Path<String>,
 ) -> ApiResult<ModelMetadataResponse> {
-    if model_name != reg.name {
+    if model_name != svc.registry.name {
         return Err(not_found(format!("no model '{model_name}'")));
     }
     Ok(Json(ModelMetadataResponse {
-        name: reg.name.clone(),
-        versions: vec![reg.version().to_string()],
+        name: svc.registry.name.clone(),
+        versions: vec![svc.registry.version().to_string()],
         platform: PLATFORM.to_string(),
     }))
 }
 
 async fn model_ready(
-    State(reg): State<Arc<ModelRegistry>>,
+    State(svc): State<Arc<DynamicBatcher>>,
     Path(model_name): Path<String>,
 ) -> StatusCode {
-    if model_name != reg.name || !reg.is_loaded() {
+    if model_name != svc.registry.name || !svc.registry.is_loaded() {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
@@ -102,15 +99,16 @@ async fn model_ready(
 // ── Inference ─────────────────────────────────────────────────────────────────
 
 async fn infer(
-    State(reg): State<Arc<ModelRegistry>>,
+    State(svc): State<Arc<DynamicBatcher>>,
     Path(model_name): Path<String>,
     Json(req): Json<InferRequest>,
 ) -> ApiResult<InferResponse> {
-    if model_name != reg.name {
+    if model_name != svc.registry.name {
         return Err(not_found(format!("no model '{model_name}'")));
     }
-
-    let model = reg.current_model().map_err(|e| unavailable(e))?;
+    if !svc.registry.is_loaded() {
+        return Err(unavailable(format!("model '{}' is not loaded", svc.registry.name)));
+    }
 
     let tensors: Result<Vec<RawTensor>, AppError> = req
         .inputs
@@ -128,9 +126,7 @@ async fn infer(
         .collect();
 
     let inputs = inference::parse_inputs(tensors?).map_err(|e| bad_request(e))?;
-    let out = inference::run_blocking(model, inputs)
-        .await
-        .map_err(|e| internal(e))?;
+    let out = svc.infer(inputs).await.map_err(|e| internal(e))?;
 
     let id = req.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let output_name = req
@@ -141,8 +137,8 @@ async fn infer(
         .unwrap_or_else(|| OUTPUT_TENSOR.to_string());
 
     Ok(Json(InferResponse {
-        model_name: reg.name.clone(),
-        model_version: reg.version().to_string(),
+        model_name: svc.registry.name.clone(),
+        model_version: svc.registry.version().to_string(),
         id,
         outputs: vec![InferOutputTensor {
             name: output_name,
@@ -156,24 +152,25 @@ async fn infer(
 // ── Repository ───────────────────────────────────────────────────────────────
 
 async fn repository_index(
-    State(reg): State<Arc<ModelRegistry>>,
+    State(svc): State<Arc<DynamicBatcher>>,
 ) -> Json<Vec<RepositoryIndexEntry>> {
-    let state = if reg.is_loaded() { "READY" } else { "UNAVAILABLE" };
+    let state = if svc.registry.is_loaded() { "READY" } else { "UNAVAILABLE" };
     Json(vec![RepositoryIndexEntry {
-        name: reg.name.clone(),
-        version: reg.version().to_string(),
+        name: svc.registry.name.clone(),
+        version: svc.registry.version().to_string(),
         state: state.to_string(),
         reason: String::new(),
     }])
 }
 
 async fn repository_load(
-    State(reg): State<Arc<ModelRegistry>>,
+    State(svc): State<Arc<DynamicBatcher>>,
     Path(model_name): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    if model_name != reg.name {
+    if model_name != svc.registry.name {
         return Err(not_found(format!("no model '{model_name}'")));
     }
+    let reg = svc.registry.clone();
     tokio::task::spawn_blocking(move || reg.repository_load())
         .await
         .map_err(|e| internal(e))?
@@ -182,13 +179,13 @@ async fn repository_load(
 }
 
 async fn repository_unload(
-    State(reg): State<Arc<ModelRegistry>>,
+    State(svc): State<Arc<DynamicBatcher>>,
     Path(model_name): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    if model_name != reg.name {
+    if model_name != svc.registry.name {
         return Err(not_found(format!("no model '{model_name}'")));
     }
-    reg.repository_unload();
+    svc.registry.repository_unload();
     Ok(StatusCode::OK)
 }
 
@@ -196,7 +193,7 @@ async fn repository_unload(
 
 pub async fn serve(
     addr: std::net::SocketAddr,
-    registry: Arc<ModelRegistry>,
+    batcher: Arc<DynamicBatcher>,
 ) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/v2/health/live", get(live))
@@ -215,7 +212,7 @@ pub async fn serve(
             post(repository_unload),
         )
         .layer(TraceLayer::new_for_http())
-        .with_state(registry);
+        .with_state(batcher);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

@@ -3,11 +3,12 @@ mod inference;
 mod model;
 mod server;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser as _;
 use tracing::info;
 
+use inference::DynamicBatcher;
 use model::ModelRegistry;
 
 #[tokio::main]
@@ -22,11 +23,13 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::parse();
 
     info!(
-        model_name    = %cfg.model_name,
-        model_path    = %cfg.model_path,
-        model_version = cfg.model_version,
-        http_port     = cfg.http_port,
-        grpc_port     = cfg.grpc_port,
+        model_name     = %cfg.model_name,
+        model_path     = %cfg.model_path,
+        model_version  = cfg.model_version,
+        http_port      = cfg.http_port,
+        grpc_port      = cfg.grpc_port,
+        max_batch_size = cfg.max_batch_size,
+        max_batch_wait = cfg.max_batch_wait_ms,
         "starting KServe CatBoost backend",
     );
 
@@ -39,14 +42,20 @@ async fn main() -> anyhow::Result<()> {
         cfg.model_version,
     ));
 
+    let batcher = Arc::new(DynamicBatcher::start(
+        registry,
+        cfg.max_batch_size,
+        Duration::from_millis(cfg.max_batch_wait_ms),
+    ));
+
     let http_addr: std::net::SocketAddr = format!("0.0.0.0:{}", cfg.http_port).parse()?;
     let grpc_addr: std::net::SocketAddr = format!("0.0.0.0:{}", cfg.grpc_port).parse()?;
 
     info!(%http_addr, %grpc_addr, "servers starting");
 
     let (http_res, grpc_res) = tokio::join!(
-        server::http::serve(http_addr, registry.clone()),
-        server::grpc::serve(grpc_addr, registry.clone()),
+        server::http::serve(http_addr, batcher.clone()),
+        server::grpc::serve(grpc_addr, batcher.clone()),
     );
 
     http_res?;
