@@ -259,10 +259,22 @@ async fn dispatch(registry: &Arc<ModelRegistry>, batch: Vec<BatchItem>, total_ro
 
     match run_blocking(model, combined).await {
         Ok(out) => {
+            let expected: usize = row_counts.iter().sum();
+            if out.predictions.len() != expected {
+                let msg = format!(
+                    "prediction length mismatch: expected {expected}, got {}",
+                    out.predictions.len()
+                );
+                for tx in senders {
+                    let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+                }
+                return;
+            }
             let mut offset = 0;
             for (tx, count) in senders.into_iter().zip(row_counts) {
-                let _ = tx.send(Ok(out.predictions[offset..offset + count].to_vec()));
-                offset += count;
+                let end = offset + count;
+                let _ = tx.send(Ok(out.predictions[offset..end].to_vec()));
+                offset = end;
             }
         }
         Err(e) => {

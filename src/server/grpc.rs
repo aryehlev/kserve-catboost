@@ -107,7 +107,12 @@ impl GrpcInferenceService for GrpcService {
             .into_iter()
             .enumerate()
             .map(|(i, t)| {
-                let data = if let Some(c) = t.contents {
+                // raw_input_contents takes priority — clients use it for
+                // performance (avoids base64/JSON overhead) and may set an
+                // empty contents field as a placeholder alongside raw bytes.
+                let data = if let Some(bytes) = raw.get(i) {
+                    TensorData::RawBytes(bytes.clone())
+                } else if let Some(c) = t.contents {
                     if !c.fp32_contents.is_empty() {
                         TensorData::Floats(c.fp32_contents)
                     } else if !c.bytes_contents.is_empty() {
@@ -123,8 +128,6 @@ impl GrpcInferenceService for GrpcService {
                     } else {
                         TensorData::Floats(vec![])
                     }
-                } else if let Some(bytes) = raw.get(i) {
-                    TensorData::RawBytes(bytes.clone())
                 } else {
                     TensorData::Floats(vec![])
                 };

@@ -13,8 +13,8 @@ use uuid::Uuid;
 use crate::inference::{self, DynamicBatcher, OverloadError, RawTensor, TensorData, OUTPUT_DTYPE, OUTPUT_TENSOR};
 use super::{
     types::{
-        ErrorResponse, InferOutputTensor, InferRequest, InferResponse, ModelMetadataResponse,
-        RepositoryIndexEntry, ServerMetadataResponse,
+        ErrorResponse, InferOutputTensor, InferRequest, InferResponse, MetadataTensor,
+        ModelMetadataResponse, RepositoryIndexEntry, ServerMetadataResponse,
     },
     EXTENSIONS, PLATFORM,
 };
@@ -86,6 +86,14 @@ async fn model_metadata(
         name: svc.registry.name.clone(),
         versions: vec![svc.registry.version().to_string()],
         platform: PLATFORM.to_string(),
+        // CatBoost doesn't expose its feature schema, so we return empty
+        // descriptor lists — consistent with the gRPC metadata response.
+        inputs: vec![],
+        outputs: vec![MetadataTensor {
+            name: crate::inference::OUTPUT_TENSOR.to_string(),
+            datatype: crate::inference::OUTPUT_DTYPE.to_string(),
+            shape: vec![-1, 1],
+        }],
     }))
 }
 
@@ -93,7 +101,9 @@ async fn model_ready(
     State(svc): State<Arc<DynamicBatcher>>,
     Path(model_name): Path<String>,
 ) -> StatusCode {
-    if model_name != svc.registry.name || !svc.registry.is_loaded() {
+    if model_name != svc.registry.name {
+        StatusCode::NOT_FOUND
+    } else if !svc.registry.is_loaded() {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK

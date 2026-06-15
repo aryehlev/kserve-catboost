@@ -68,6 +68,12 @@ pub fn decode_raw_floats(bytes: &[u8], datatype: &str) -> Result<Vec<f32>> {
         "INT64" => chunked(bytes, 8, |c| {
             i64::from_le_bytes(c.try_into().unwrap()) as f32
         }),
+        "UINT32" => chunked(bytes, 4, |c| {
+            u32::from_le_bytes(c.try_into().unwrap()) as f32
+        }),
+        "UINT64" => chunked(bytes, 8, |c| {
+            u64::from_le_bytes(c.try_into().unwrap()) as f32
+        }),
         dt => Err(anyhow!("cannot decode {dt} from raw bytes")),
     }
 }
@@ -95,12 +101,29 @@ pub fn decode_raw_strings(bytes: &[u8]) -> Result<Vec<String>> {
         result.push(String::from_utf8(bytes[pos..pos + len].to_vec())?);
         pos += len;
     }
+    if pos != bytes.len() {
+        return Err(anyhow!("malformed BYTES tensor: trailing bytes after last string"));
+    }
     Ok(result)
 }
 
-pub fn reshape<T: Clone>(flat: Vec<T>, shape: &[i64]) -> Vec<Vec<T>> {
-    let cols = shape.get(1).copied().unwrap_or(1).max(1) as usize;
-    flat.chunks(cols).map(|c| c.to_vec()).collect()
+/// Reshape a flat vector into rows using shape[1] as the column count.
+/// Returns an error if the data length is not evenly divisible by the column count.
+pub fn reshape<T: Clone>(flat: Vec<T>, shape: &[i64]) -> Result<Vec<Vec<T>>> {
+    let cols_i64 = shape.get(1).copied().unwrap_or(1);
+    if cols_i64 <= 0 {
+        return Err(anyhow!(
+            "invalid tensor shape: non-positive column count {cols_i64}"
+        ));
+    }
+    let cols = cols_i64 as usize;
+    if flat.len() % cols != 0 {
+        return Err(anyhow!(
+            "tensor data length {} is not divisible by column count {cols}",
+            flat.len()
+        ));
+    }
+    Ok(flat.chunks_exact(cols).map(|c| c.to_vec()).collect())
 }
 
 /// Convert a list of RawTensors into InferInputs.
@@ -121,7 +144,7 @@ pub fn parse_inputs(tensors: Vec<RawTensor>) -> Result<super::InferInputs> {
                         return Err(anyhow!("expected numeric data for tensor '{}'", t.name))
                     }
                 };
-                float_features = reshape(flat, &t.shape);
+                float_features = reshape(flat, &t.shape)?;
                 got_floats = true;
             }
             "BYTES" | "STRING" if !got_cats => {
@@ -132,7 +155,7 @@ pub fn parse_inputs(tensors: Vec<RawTensor>) -> Result<super::InferInputs> {
                         return Err(anyhow!("expected string data for tensor '{}'", t.name))
                     }
                 };
-                cat_features = reshape(flat, &t.shape);
+                cat_features = reshape(flat, &t.shape)?;
                 got_cats = true;
             }
             _ => {}
