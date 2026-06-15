@@ -29,6 +29,8 @@ impl std::error::Error for OverloadError {}
 struct BatchItem {
     float_features: Vec<Vec<f32>>,
     cat_features: Vec<Vec<String>>,
+    /// Number of rows this item contributes (pre-computed; equal to the
+    /// number of feature-vectors in float_features or cat_features).
     row_count: usize,
     tx: oneshot::Sender<Result<Vec<f64>>>,
 }
@@ -37,9 +39,15 @@ struct BatchItem {
 /// CatBoost call per batch instead of one per request.
 ///
 /// Batch dispatch is triggered by the first of:
-///   1. `total_rows >= max_batch_size`  (hard ceiling)
+///   1. `total_rows >= max_batch_size`  (soft row ceiling — see note below)
 ///   2. `total_rows >= any preferred_batch_size`  (Triton-style early dispatch)
 ///   3. `max_wait` has elapsed since the first request in the batch arrived
+///
+/// Note on the row ceiling: because we cannot inspect a request's row count
+/// before receiving it, `max_batch_size` is a *soft* ceiling. A single
+/// multi-row request received just as the ceiling is approached may push
+/// `total_rows` slightly over it. In the typical KServe case every request
+/// carries exactly one row, so the ceiling is exact.
 ///
 /// `num_workers` independent batch-loop tasks run in parallel, each with its
 /// own channel. Incoming requests are distributed round-robin so multiple
@@ -66,7 +74,8 @@ impl DynamicBatcher {
         let num_workers = num_workers.max(1);
         // Per-worker channel capacity: 4× batch ceiling so senders are rarely
         // blocked, but backpressure still engages under sustained overload.
-        let capacity = (max_batch_size * 4).max(64);
+        // saturating_mul avoids overflow for very large max_batch_size values.
+        let capacity = max_batch_size.saturating_mul(4).max(64);
 
         let mut senders = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
@@ -105,7 +114,10 @@ impl DynamicBatcher {
         let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
 
         // Try each worker in order; use the first one with queue space.
-        // Only return OverloadError if every worker's queue is full.
+        // A closed worker is treated as a failed candidate so we keep
+        // probing rather than aborting on the first dead channel.
+        let mut saw_full = false;
+        let mut saw_closed = false;
         for i in 0..n {
             let idx = (start + i) % n;
             match self.senders[idx].try_send(item) {
@@ -119,15 +131,24 @@ impl DynamicBatcher {
                     });
                 }
                 Err(mpsc::error::TrySendError::Full(returned)) => {
+                    saw_full = true;
                     item = returned; // try next worker
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(anyhow::anyhow!("batcher shut down"));
+                Err(mpsc::error::TrySendError::Closed(returned)) => {
+                    saw_closed = true;
+                    item = returned; // try next worker
                 }
             }
         }
 
-        Err(anyhow::Error::new(OverloadError))
+        // Report the most actionable error: full queues before dead workers.
+        if saw_full {
+            Err(anyhow::Error::new(OverloadError))
+        } else if saw_closed {
+            Err(anyhow::anyhow!("batcher shut down"))
+        } else {
+            Err(anyhow::anyhow!("batcher has no workers"))
+        }
     }
 }
 
@@ -144,24 +165,25 @@ async fn batch_loop(
     max_wait: Duration,
     preferred_batch_sizes: Vec<usize>,
 ) {
-    let item_limit = max_batch_size.max(1);
-
     loop {
-        let mut batch: Vec<BatchItem> = Vec::with_capacity(item_limit);
+        let mut batch: Vec<BatchItem> = Vec::with_capacity(max_batch_size.max(1));
 
         // ── Phase 1: blocking wait ────────────────────────────────────────────
-        // recv_many suspends until ≥1 request arrives, then atomically drains
-        // as many as `item_limit` in one go — a single async yield may fill
-        // the whole batch when many callers are already queued.
-        let n = rx.recv_many(&mut batch, item_limit).await;
-        if n == 0 {
-            return; // all senders dropped; shut down
-        }
-        let mut total_rows: usize = batch.iter().map(|i| i.row_count).sum();
+        // Block until at least one request arrives. Using a single recv()
+        // here (rather than recv_many) keeps the row ceiling accurate: the
+        // try_recv drain below then pulls additional items synchronously
+        // while checking total_rows against max_batch_size after each one,
+        // so we never overshoot by more than one item's row count.
+        let first = match rx.recv().await {
+            Some(item) => item,
+            None => return, // all senders dropped; shut down
+        };
+        let mut total_rows = first.row_count;
+        batch.push(first);
 
         // ── Phase 1b: synchronous drain ───────────────────────────────────────
-        // Grab any items that are already in the channel without paying async
-        // overhead. Closes the gap between Phase 1 and Phase 2 cheaply.
+        // Pull any already-queued items without async overhead.
+        // Stops at the row ceiling so overshoot is bounded to ≤1 item.
         while total_rows < max_batch_size {
             match rx.try_recv() {
                 Ok(item) => {
@@ -176,6 +198,10 @@ async fn batch_loop(
         // Collect stragglers until the batch hits a dispatch threshold or the
         // deadline fires. Using sleep_until (absolute) avoids drift when the
         // loop body takes non-zero time.
+        //
+        // Deadline branch is listed first under `biased;` so it fires
+        // immediately once the instant passes — continuous queue traffic
+        // cannot starve it and violate the MAX_BATCH_WAIT_MS bound.
         let needs_wait = !max_wait.is_zero()
             && total_rows < max_batch_size
             && !hits_preferred(&preferred_batch_sizes, total_rows);
@@ -190,14 +216,13 @@ async fn batch_loop(
                     break 'collect;
                 }
 
-                let remaining = (max_batch_size.saturating_sub(batch.len())).max(1);
+                // Receive one item at a time so we re-check the row ceiling
+                // after each arrival and minimise overshoot.
                 let mut extra: Vec<BatchItem> = Vec::new();
-
                 tokio::select! {
-                    // biased: prefer draining the channel over the timer so a
-                    // burst of requests fills the batch before we give up.
                     biased;
-                    got = rx.recv_many(&mut extra, remaining) => {
+                    _ = tokio::time::sleep_until(deadline) => break 'collect,
+                    got = rx.recv_many(&mut extra, 1) => {
                         if got == 0 { break 'collect; } // channel closed
                         for item in extra {
                             total_rows += item.row_count;
@@ -211,7 +236,6 @@ async fn batch_loop(
                             }
                         }
                     }
-                    _ = tokio::time::sleep_until(deadline) => break 'collect,
                 }
             }
         }
@@ -226,15 +250,26 @@ async fn dispatch(registry: &Arc<ModelRegistry>, batch: Vec<BatchItem>, total_ro
     let mut row_counts: Vec<usize> = Vec::with_capacity(batch.len());
     let mut senders: Vec<oneshot::Sender<Result<Vec<f64>>>> = Vec::with_capacity(batch.len());
 
+    let has_floats = batch.iter().any(|i| !i.float_features.is_empty());
     let has_cats = batch.iter().any(|i| !i.cat_features.is_empty());
 
     for mut item in batch {
         row_counts.push(item.row_count);
         senders.push(item.tx);
-        all_floats.append(&mut item.float_features);
+        // Pad missing float rows symmetrically with empty vecs when other
+        // items in the batch carry float features.
+        if has_floats {
+            if item.float_features.is_empty() {
+                all_floats.extend(std::iter::repeat_with(Vec::new).take(item.row_count));
+            } else {
+                all_floats.append(&mut item.float_features);
+            }
+        }
+        // Pad missing cat rows symmetrically with empty vecs when other
+        // items in the batch carry categorical features.
         if has_cats {
             if item.cat_features.is_empty() {
-                all_cats.extend(std::iter::repeat_n(vec![], item.row_count));
+                all_cats.extend(std::iter::repeat_with(Vec::new).take(item.row_count));
             } else {
                 all_cats.append(&mut item.cat_features);
             }
