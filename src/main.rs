@@ -57,12 +57,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!(%http_addr, %grpc_addr, "servers starting");
 
-    let (http_res, grpc_res) = tokio::join!(
+    tokio::try_join!(
         server::http::serve(http_addr, batcher.clone()),
         server::grpc::serve(grpc_addr, batcher.clone()),
-    );
-
-    http_res?;
-    grpc_res?;
+    )?;
     Ok(())
 }

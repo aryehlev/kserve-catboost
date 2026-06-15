@@ -8,9 +8,9 @@ use super::{
     proto::inference::{
         grpc_inference_service_server::{GrpcInferenceService, GrpcInferenceServiceServer},
         InferOutputTensor, InferTensorContents, ModelInferRequest, ModelInferResponse,
-        ModelMetadataRequest, ModelMetadataResponse, ModelReadyRequest, ModelReadyResponse,
-        ServerLiveRequest, ServerLiveResponse, ServerMetadataRequest, ServerMetadataResponse,
-        ServerReadyRequest, ServerReadyResponse,
+        ModelMetadataOutput, ModelMetadataRequest, ModelMetadataResponse, ModelReadyRequest,
+        ModelReadyResponse, ServerLiveRequest, ServerLiveResponse, ServerMetadataRequest,
+        ServerMetadataResponse, ServerReadyRequest, ServerReadyResponse,
     },
     EXTENSIONS, PLATFORM,
 };
@@ -76,7 +76,11 @@ impl GrpcInferenceService for GrpcService {
             versions: vec![self.batcher.registry.version().to_string()],
             platform: PLATFORM.to_string(),
             inputs: vec![],
-            outputs: vec![],
+            outputs: vec![ModelMetadataOutput {
+                name: crate::inference::OUTPUT_TENSOR.to_string(),
+                datatype: crate::inference::OUTPUT_DTYPE.to_string(),
+                shape: vec![-1, 1],
+            }],
         }))
     }
 
@@ -161,11 +165,13 @@ impl GrpcInferenceService for GrpcService {
         } else {
             id
         };
-        let output_name = requested_outputs
-            .into_iter()
-            .next()
-            .map(|o| o.name)
-            .unwrap_or_else(|| OUTPUT_TENSOR.to_string());
+        let output_name = match requested_outputs.len() {
+            0 => OUTPUT_TENSOR.to_string(),
+            1 => requested_outputs.into_iter().next().unwrap().name,
+            _ => return Err(Status::invalid_argument(
+                "multiple outputs are not supported by this model",
+            )),
+        };
 
         Ok(Response::new(ModelInferResponse {
             model_name: self.batcher.registry.name.clone(),
